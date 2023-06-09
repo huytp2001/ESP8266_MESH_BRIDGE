@@ -1,10 +1,6 @@
 // Bridge 
 #include <Arduino.h>
-#include "IPAddress.h"
 #include "painlessMesh.h"
-#include "Hash.h"
-#include <ESPAsyncTCP.h>
-#include <ESPAsyncWebServer.h>
 #include <Wire.h>
 #include <BH1750.h>
 #include <Adafruit_Sensor.h>
@@ -12,32 +8,25 @@
 #include <Ticker.h>
 #include <vector>
 
-#define   MESH_PREFIX     "whateverYouLike"
-#define   MESH_PASSWORD   "somethingSneaky"
-#define   MESH_PORT       5555
-#define MAX_PACKET_SIZE   1000
-
-#define   STATION_SSID     "Hung -2.4G"
-#define   STATION_PASSWORD "02081996"
-
-#define HOSTNAME "HTTP_BRIDGE"
-
-#define DHTPIN 2
-#define DHTTYPE DHT22
+#define     MESH_PREFIX       "whateverYouLike"
+#define     MESH_PASSWORD     "somethingSneaky"
+#define     MESH_PORT         5555
+#define     MAX_PACKET_SIZE   1000
+#define     DHTPIN            2
+#define     DHTTYPE           DHT22
 
 void receivedCallback( const uint32_t &from, const String &msg );
-IPAddress getlocalIP();
 
 painlessMesh  mesh;
-AsyncWebServer server(80);
-AsyncWebSocket ws("/ws");
-
-IPAddress myIP(0,0,0,0);
-IPAddress myAPIP(0,0,0,0);
+Scheduler userScheduler;
 
 BH1750 lightMeter;
 DHT dht(DHTPIN, DHTTYPE);
 Ticker myTicker;
+
+bool ws_flag = false;
+float temp_tem, temp_hum, temp_lux;
+int temp_rain;
 
 std::vector<String> split_string(String &input_string, char delimiter) {
   std::vector<String> result;
@@ -52,7 +41,6 @@ std::vector<String> split_string(String &input_string, char delimiter) {
     }
   }
   result.push_back(temp_string);
-
   return result;
 }
 
@@ -144,25 +132,6 @@ public:
     data_ = parts[5];
   }
 
-    void printOut() {
-    Serial.print("Src: ");
-    Serial.println(src_);
-    Serial.print("Seq_num: ");
-    Serial.println(seq_num_);
-    Serial.print("Hop: ");
-    for (String hop: hops_) {
-      Serial.print(hop);
-      Serial.print(",");
-    }
-    Serial.println();
-    Serial.print("Max_seq: ");
-    Serial.println(max_seq_);
-    Serial.print("Des: ");
-    Serial.println(des_);
-    Serial.print("Data: ");
-    Serial.println(data_);
-  }
-
 private:
   String src_;
   int seq_num_;
@@ -173,82 +142,64 @@ private:
 };
 
 void sendSensorData() {
-  String payload = "sensordata|";
-  payload += String(dht.readTemperature()) + "|";
-  payload += String(dht.readHumidity()) + "|";
-  payload += String(analogRead(A0)) + "|";
-  payload += String(lightMeter.readLightLevel());
-  ws.textAll(payload);
-}
-
-void sendSensorData_get(AsyncWebServerRequest *request) {
-  String payload = String(dht.readTemperature()) + "|";
-  payload += String(dht.readHumidity()) + "|";
-  payload += String(analogRead(A0)) + "|";
-  payload += String(lightMeter.readLightLevel());
-  request->send(200, "text/plain", payload);
+    if (temp_tem != dht.readTemperature() || temp_hum != dht.readHumidity() || temp_rain != analogRead(A0) || temp_lux != lightMeter.readLightLevel()) {
+        temp_tem = dht.readTemperature();
+        temp_hum = dht.readHumidity();
+        temp_rain = analogRead(A0);
+        temp_lux = lightMeter.readLightLevel();
+        String payload = "sensorstream|";
+        payload += String(temp_tem) + "|";
+        payload += String(temp_hum) + "|";
+        payload += String(temp_rain) + "|";
+        payload += String(temp_lux);
+        Serial.println(payload);
+    }
 }
 
 void setup() {
   Serial.begin(115200);
 
   mesh.setDebugMsgTypes( ERROR | STARTUP | CONNECTION );  
-  mesh.init( MESH_PREFIX, MESH_PASSWORD, MESH_PORT, WIFI_AP_STA, 6);
+  mesh.init( MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT );
   mesh.onReceive(&receivedCallback);
-  mesh.stationManual(STATION_SSID, STATION_PASSWORD);
-  mesh.setHostname(HOSTNAME);
   mesh.setRoot(true);
   mesh.setContainsRoot(true);
 
-  myAPIP = IPAddress(mesh.getAPIP());
-  Serial.println("My AP IP is " + myAPIP.toString());
-
-  server.on("/sensorData", HTTP_GET, sendSensorData_get);
-
-  server.addHandler(&ws);
-  server.begin();
-
   Wire.begin();
   lightMeter.begin();
-  Serial.println(F("BH1750 begin"));
   dht.begin();
-  Serial.println(F("DHT begin"));
+  myTicker.attach(10, sendSensorData);
 }
-
-bool ws_flag = false;
 
 void loop() {
   mesh.update();
-  if(myIP != getlocalIP()){
-    myIP = getlocalIP();
-    Serial.println("My IP is " + myIP.toString());
-    myTicker.attach(5, sendSensorData);
-    ws_flag = true;
+  if (Serial.available()) {
+    if (Serial.readStringUntil('\n') == "give me data") {
+      String payload = "sensordata|";
+      payload += String(temp_tem) + "|";
+      payload += String(temp_hum) + "|";
+      payload += String(temp_rain) + "|";
+      payload += String(temp_lux);
+      Serial.println(payload);
+    }
   }
 }
 
 void receivedCallback( const uint32_t &from, const String &msg ) {
-  Serial.print("Receive packet: ");
   Packet packet = Packet();
   packet.from_string(msg);
   if (packet.get_des() == String(mesh.getNodeId())) {
-    Serial.println("Message arriving successful");
-    ws.textAll(packet.get_data());
+    Serial.println(packet.get_data());
     return;
   }
   for (String hop : packet.get_hops()) {
     if (hop == String(mesh.getNodeId())) {
-      Serial.println("Message being block");
       return;
     }
   }
-  Serial.println("Message being forward");
   packet.add_hop(String(mesh.getNodeId()));
   mesh.sendBroadcast(packet.to_string());
 }
 
-IPAddress getlocalIP() {
-  return IPAddress(mesh.getStationIP());
-}
 
 
